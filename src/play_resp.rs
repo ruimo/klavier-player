@@ -18,8 +18,8 @@ pub enum CmdInfo {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Resp {
-    Err { seq: Option<usize>, msg: String },
-    Info { seq: Option<usize>, info: CmdInfo },
+    Err { seq: usize, msg: String },
+    Info { seq: usize, info: CmdInfo },
     Ok { seq: usize, status: Status },
     Aborted,
 }

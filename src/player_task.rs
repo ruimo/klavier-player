@@ -1,10 +1,8 @@
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use crate::play_resp::Status;
-use crate::player_state::PlayerState;
-use crate::{play_cmd::{Cmd, PlayCmdData, CmdError}, play_resp::{Resp, CmdInfo}, midi_output::MidiOutput};
+use crate::{play_cmd::{Cmd, PlayCmdData}, play_resp::{Resp, CmdInfo}, midi_output::MidiOutput};
 
 const CYCLE_DURATION_NANOS: u64 = 1_000; // 1us = 1000ns
 
@@ -27,126 +25,271 @@ impl Clock for SystemClock {
   }
 }
 
-pub fn run(mut midi_conn: impl MidiOutput, cmd_receiver: Receiver<Cmd>, resp_sender: SyncSender<Resp>) {
-  let clock = SystemClock;
-  let mut current_play_state: Option<PlayState> = None;
-  
-  while run_iteration(&mut current_play_state, &mut midi_conn, &cmd_receiver, &resp_sender, &clock) {
-    // Eternal loop
-  }
-
-  match resp_sender.send(Resp::Aborted) {
-    Ok(_) => {},
-    Err(e) => error!("Midi player aborted: {:?}", e),
-  }
-}
-
-/// Executes one iteration of the player task loop.
-/// Returns `true` to continue the loop, `false` to exit.
-fn run_iteration(
-  current_play_state: &mut Option<PlayState>,
-  midi_conn: &mut impl MidiOutput,
-  cmd_receiver: &Receiver<Cmd>,
-  resp_sender: &SyncSender<Resp>,
-  clock: &impl Clock,
-) -> bool {
-  if let Some(play_state) = current_play_state.take() {
-    // If playing, perform playback
-    *current_play_state = handle_playing_state(play_state, midi_conn, cmd_receiver, resp_sender, clock);
-    true
-  } else {
-    // If not playing, wait for a command (blocking)
-    handle_idle_state(cmd_receiver, resp_sender, current_play_state, clock);
-    current_play_state.is_some()
-  }
-}
-
-fn handle_idle_state(
-  cmd_receiver: &Receiver<Cmd>,
-  resp_sender: &SyncSender<Resp>,
-  current_play_state: &mut Option<PlayState>,
-  clock: &impl Clock,
-) {
-  match cmd_receiver.recv() {
-    Ok(Cmd::Play(play_cmd_data)) => {
-      info!("Play command received: seq={}, start_cycle={}", play_cmd_data.seq, play_cmd_data.start_cycle);
-      let cycle_offset = play_cmd_data.start_cycle;
-      let start_idx = match play_cmd_data.play_data.midi_data.find(&cycle_offset) {
-        Ok(idx) => idx,
-        Err(idx) => idx,
-      };
-      *current_play_state = Some(PlayState {
-        play_cmd_data,
-        cycle_offset,
-        start_timestamp: clock.now(),
-        current_idx: start_idx,
-      });
-      resp(resp_sender, Resp::Ok { seq: current_play_state.as_ref().unwrap().play_cmd_data.seq, status: Status::Playing });
-    }
-    Ok(Cmd::Stop { seq }) => {
-      error!("Already stopped, just ignored: seq={}", seq);
-      resp(resp_sender, Resp::Ok { seq, status: Status::Stopped });
-    }
-    Err(e) => {
-      error!("Player task cannot receive command: {:?}", e);
-      current_play_state.take();
-    }
-  }
-}
-
-fn handle_playing_state(
-  mut play_state: PlayState,
-  midi_conn: &mut impl MidiOutput,
-  cmd_receiver: &Receiver<Cmd>,
-  resp_sender: &SyncSender<Resp>,
-  clock: &impl Clock,
-) -> Option<PlayState> {
-  match play_cycle(&mut play_state, midi_conn, cmd_receiver, clock) {
-    PlayResult::Continue => {
-      // Continue to next cycle
-      Some(play_state)
-    }
-    PlayResult::Finished => {
-      info!("Playback finished: seq={}", play_state.play_cmd_data.seq);
-      resp(resp_sender, Resp::Info {
-        seq: Some(play_state.play_cmd_data.seq),
-        info: CmdInfo::PlayingEnded
-      });
-      None
-    }
-    PlayResult::Stopped => {
-      info!("Playback stopped: seq={}", play_state.play_cmd_data.seq);
-      resp(resp_sender, Resp::Ok { seq: play_state.play_cmd_data.seq, status: Status::Stopped });
-      None
-    }
-    PlayResult::Interrupted(new_play_cmd_data) => {
-      info!("Playback interrupted: old_seq={}, new_seq={}", play_state.play_cmd_data.seq, new_play_cmd_data.seq);
-      let cycle_offset = new_play_cmd_data.start_cycle;
-      let start_idx = match new_play_cmd_data.play_data.midi_data.find(&cycle_offset) {
-        Ok(idx) => idx,
-        Err(idx) => idx,
-      };
-      let new_state = PlayState {
-        play_cmd_data: *new_play_cmd_data,
-        cycle_offset,
-        start_timestamp: clock.now(),
-        current_idx: start_idx,
-      };
-      resp(resp_sender, Resp::Ok { seq: new_state.play_cmd_data.seq, status: Status::Playing });
-      Some(new_state)
-    }
-    PlayResult::Error(msg) => {
-      error!("Playback error: seq={}", play_state.play_cmd_data.seq);
-      None
-    }
-  }
-}
-
 struct PlayState {
   play_cmd_data: PlayCmdData,
   cycle_offset: u64,
   start_timestamp: Instant,
   current_idx: usize,
+}
+
+/// PlayerTask manages the player loop state and operations
+struct PlayerTask<M: MidiOutput, C: Clock> {
+  play_state: Option<PlayState>,
+  midi_conn: M,
+  cmd_receiver: Receiver<Cmd>,
+  resp_sender: SyncSender<Resp>,
+  clock: C,
+}
+
+impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
+  /// Consumes the PlayerTask and returns its internal components.
+  ///
+  /// # Returns
+  /// A tuple containing:
+  /// - `play_state`: The current play state (if any)
+  /// - `midi_conn`: The MIDI connection
+  /// - `cmd_receiver`: The command receiver
+  /// - `resp_sender`: The response sender
+  /// - `clock`: The clock implementation
+  fn take(self) -> (
+    Option<PlayState>,
+    M,
+    Receiver<Cmd>,
+    SyncSender<Resp>,
+    C,
+  ) {
+    (
+      self.play_state,
+      self.midi_conn,
+      self.cmd_receiver,
+      self.resp_sender,
+      self.clock,
+    )
+  }
+}
+
+impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
+  fn new(
+    midi_conn: M,
+    cmd_receiver: Receiver<Cmd>,
+    resp_sender: SyncSender<Resp>,
+    clock: C,
+  ) -> Self {
+    Self {
+      play_state: None,
+      midi_conn,
+      cmd_receiver,
+      resp_sender,
+      clock,
+    }
+  }
+
+  /// Executes one iteration of the player task loop.
+  /// Returns `true` to continue the loop, `false` to exit.
+  fn run_iteration(&mut self) -> bool {
+    if let Some(play_state) = self.play_state.take() {
+      // If playing, perform playback
+      self.handle_playing_state(play_state);
+    } else {
+      // If not playing, wait for a command (blocking)
+      self.handle_idle_state();
+    }
+    self.play_state.is_some()
+  }
+
+  fn handle_idle_state(&mut self) {
+    match self.cmd_receiver.recv() {
+      Ok(Cmd::Play(play_cmd_data)) => {
+        info!("Play command received: seq={}, start_cycle={}", play_cmd_data.seq, play_cmd_data.start_cycle);
+        let cycle_offset = play_cmd_data.start_cycle;
+        let start_idx = match play_cmd_data.play_data.midi_data.find(&cycle_offset) {
+          Ok(idx) => idx,
+          Err(idx) => idx,
+        };
+        self.play_state = Some(PlayState {
+          play_cmd_data,
+          cycle_offset,
+          start_timestamp: self.clock.now(),
+          current_idx: start_idx,
+        });
+        self.resp(Resp::Ok { seq: self.play_state.as_ref().unwrap().play_cmd_data.seq, status: Status::Playing });
+      }
+      Ok(Cmd::Stop { seq }) => {
+        error!("Already stopped, just ignored: seq={}", seq);
+        self.resp(Resp::Ok { seq, status: Status::Stopped });
+      }
+      Err(e) => {
+        error!("Player task cannot receive command: {:?}", e);
+        self.play_state.take();
+      }
+    }
+  }
+
+  fn handle_playing_state(&mut self, mut play_state: PlayState) {
+    match self.play_cycle(&mut play_state) {
+      PlayResult::Continue => {
+        self.play_state = Some(play_state);
+      }
+      PlayResult::Finished => {
+        info!("Playback finished: seq={}", play_state.play_cmd_data.seq);
+        self.resp(Resp::Info {
+          seq: play_state.play_cmd_data.seq,
+          info: CmdInfo::PlayingEnded
+        });
+      }
+      PlayResult::Stopped => {
+        info!("Playback stopped: seq={}", play_state.play_cmd_data.seq);
+        self.resp(Resp::Ok { seq: play_state.play_cmd_data.seq, status: Status::Stopped });
+      }
+      PlayResult::Interrupted(new_play_cmd_data) => {
+        info!("Playback interrupted: old_seq={}, new_seq={}", play_state.play_cmd_data.seq, new_play_cmd_data.seq);
+        let cycle_offset = new_play_cmd_data.start_cycle;
+        let start_idx = match new_play_cmd_data.play_data.midi_data.find(&cycle_offset) {
+          Ok(idx) => idx,
+          Err(idx) => idx,
+        };
+        self.play_state = Some(PlayState {
+          play_cmd_data: *new_play_cmd_data,
+          cycle_offset,
+          start_timestamp: self.clock.now(),
+          current_idx: start_idx,
+        });
+        self.resp(Resp::Ok { seq: self.play_state.as_ref().unwrap().play_cmd_data.seq, status: Status::Playing });
+      }
+      PlayResult::Error(msg) => {
+        let seq = play_state.play_cmd_data.seq;
+        error!("Playback error(seq={}): {}", seq, msg);
+        self.resp(Resp::Err { seq, msg });
+      }
+    }
+  }
+
+  fn play_cycle(&mut self, play_state: &mut PlayState) -> PlayResult {
+    let seq = play_state.play_cmd_data.seq;
+    
+    if let Some(result) = self.process_command(seq) {
+      return result;
+    }
+    
+    // Calculate current playback position from elapsed time
+    let current_position: u64 = self.calculate_current_position(play_state);
+    
+    // Find the index of events to process
+    let next_idx = match play_state.play_cmd_data.play_data.midi_data.find(&current_position) {
+      Ok(idx) => idx,
+      Err(idx) => idx,
+    };
+    
+    // Send MIDI events
+    if let Err(result) = self.send_midi_events(play_state, next_idx) {
+      return result;
+    }
+    
+    // Wait for next event or finish
+    self.wait_for_next_event(play_state, next_idx)
+  }
+
+  /// Process incoming commands (Stop or Play) during playback.
+  /// Returns Some(PlayResult) if a command was received that should interrupt playback,
+  /// or None if playback should continue normally.
+  fn process_command(&self, current_seq: usize) -> Option<PlayResult> {
+    match self.cmd_receiver.try_recv() {
+      Ok(Cmd::Stop { seq: stop_seq }) => {
+        info!("Stop command received: seq={}", stop_seq);
+        if stop_seq == current_seq {
+          Some(PlayResult::Stopped)
+        } else {
+          warn!("Stop command seq mismatch: expected={}, got={}", current_seq, stop_seq);
+          None
+        }
+      }
+      Ok(Cmd::Play(new_play_cmd_data)) => {
+        info!("Play command received while already playing, interrupting current playback");
+        Some(PlayResult::Interrupted(Box::new(new_play_cmd_data)))
+      }
+      Err(TryRecvError::Empty) => {
+        // No command, continue playing
+        None
+      }
+      Err(TryRecvError::Disconnected) => {
+        let msg = "Command channel disconnected".to_owned();
+        error!(msg);
+        Some(PlayResult::Error(msg))
+      }
+    }
+  }
+
+  /// Calculate the current playback position based on elapsed time
+  fn calculate_current_position(&self, play_state: &PlayState) -> u64 {
+    let now = self.clock.now();
+    let elapsed = now.duration_since(play_state.start_timestamp);
+    let elapsed_cycles = elapsed.as_nanos() / CYCLE_DURATION_NANOS as u128;
+    play_state.cycle_offset + elapsed_cycles as u64
+  }
+
+  /// Send MIDI events from current_idx up to (but not including) next_idx
+  fn send_midi_events(
+    &mut self,
+    play_state: &mut PlayState,
+    next_idx: usize,
+  ) -> Result<(), PlayResult> {
+    let mut idx = play_state.current_idx;
+    
+    while idx < next_idx {
+      let (_cycle, midi_msgs) = &play_state.play_cmd_data.play_data.midi_data[idx];
+      for message in midi_msgs {
+        if let Err(e) = self.midi_conn.send(message) {
+          let msg = format!("Failed to send MIDI message: {:?}", e);
+          error!(msg);
+          return Err(PlayResult::Error(msg));
+        }
+      }
+      idx += 1;
+    }
+    
+    play_state.current_idx = next_idx;
+    Ok(())
+  }
+
+  /// Calculate and execute sleep until the next event
+  fn wait_for_next_event(
+    &self,
+    play_state: &PlayState,
+    next_idx: usize,
+  ) -> PlayResult {
+    if play_state.play_cmd_data.play_data.midi_data.len() <= next_idx {
+      PlayResult::Finished
+    } else {
+      let now = self.clock.now();
+      let (next_cycle, _) = play_state.play_cmd_data.play_data.midi_data[next_idx];
+      let cycles_from_start = next_cycle.saturating_sub(play_state.cycle_offset);
+      let target_time = play_state.start_timestamp + Duration::from_nanos(cycles_from_start * CYCLE_DURATION_NANOS);
+      let sleep_duration = target_time - now;
+      self.clock.sleep(sleep_duration);
+      PlayResult::Continue
+    }
+  }
+
+  fn resp(&self, resp: Resp) {
+    if let Err(e) = self.resp_sender.send(resp) {
+      println!("Cannot send response: {:?}.", e);
+    }
+  }
+}
+
+pub fn run(midi_conn: impl MidiOutput, cmd_receiver: Receiver<Cmd>, resp_sender: SyncSender<Resp>) {
+  let clock = SystemClock;
+  let mut player_task = PlayerTask::new(midi_conn, cmd_receiver, resp_sender, clock);
+  
+  while player_task.run_iteration() {
+    // Eternal loop
+  }
+
+  let (_, _, _, resp_sender, _) = player_task.take();
+  match resp_sender.send(Resp::Aborted) {
+    Ok(_) => {},
+    Err(e) => error!("Midi player aborted: {:?}", e),
+  }
 }
 
 enum PlayResult {
@@ -155,127 +298,6 @@ enum PlayResult {
   Stopped,
   Interrupted(Box<PlayCmdData>),
   Error(String),
-}
-
-/// Process incoming commands (Stop or Play) during playback.
-/// Returns Some(PlayResult) if a command was received that should interrupt playback,
-/// or None if playback should continue normally.
-fn process_command(
-  cmd_receiver: &Receiver<Cmd>,
-  current_seq: usize,
-) -> Option<PlayResult> {
-  match cmd_receiver.try_recv() {
-    Ok(Cmd::Stop { seq: stop_seq }) => {
-      info!("Stop command received: seq={}", stop_seq);
-      if stop_seq == current_seq {
-        Some(PlayResult::Stopped)
-      } else {
-        warn!("Stop command seq mismatch: expected={}, got={}", current_seq, stop_seq);
-        None
-      }
-    }
-    Ok(Cmd::Play(new_play_cmd_data)) => {
-      info!("Play command received while already playing, interrupting current playback");
-      Some(PlayResult::Interrupted(Box::new(new_play_cmd_data)))
-    }
-    Err(TryRecvError::Empty) => {
-      // No command, continue playing
-      None
-    }
-    Err(TryRecvError::Disconnected) => {
-      let msg = "Command channel disconnected".to_owned();
-      error!(msg);
-      Some(PlayResult::Error(msg))
-    }
-  }
-}
-
-/// Calculate the current playback position based on elapsed time
-fn calculate_current_position(play_state: &PlayState, clock: &impl Clock) -> u64 {
-  let now = clock.now();
-  let elapsed = now.duration_since(play_state.start_timestamp);
-  let elapsed_cycles = elapsed.as_nanos() / CYCLE_DURATION_NANOS as u128;
-  play_state.cycle_offset + elapsed_cycles as u64
-}
-
-/// Send MIDI events from current_idx up to (but not including) next_idx
-fn send_midi_events(
-  play_state: &mut PlayState,
-  next_idx: usize,
-  conn_out: &mut impl MidiOutput,
-  seq: usize,
-) -> Result<(), PlayResult> {
-  let mut idx = play_state.current_idx;
-  
-  while idx < next_idx {
-    let (_cycle, midi_msgs) = &play_state.play_cmd_data.play_data.midi_data[idx];
-    for message in midi_msgs {
-      if let Err(e) = conn_out.send(message) {
-        let msg = format!("Failed to send MIDI message: {:?}", e);
-        error!(msg);
-        return Err(PlayResult::Error(msg));
-      }
-    }
-    idx += 1;
-  }
-  
-  play_state.current_idx = next_idx;
-  Ok(())
-}
-
-/// Calculate and execute sleep until the next event
-fn wait_for_next_event(
-  play_state: &PlayState,
-  next_idx: usize,
-  clock: &impl Clock,
-) -> PlayResult {
-  if play_state.play_cmd_data.play_data.midi_data.len() <= next_idx {
-    PlayResult::Finished
-  } else {
-    let now = clock.now();
-    let (next_cycle, _) = play_state.play_cmd_data.play_data.midi_data[next_idx];
-    let cycles_from_start = next_cycle.saturating_sub(play_state.cycle_offset);
-    let target_time = play_state.start_timestamp + Duration::from_nanos(cycles_from_start * CYCLE_DURATION_NANOS);
-    let sleep_duration = target_time - now;
-    clock.sleep(sleep_duration);
-    PlayResult::Continue
-  }
-}
-
-fn play_cycle(
-  play_state: &mut PlayState,
-  conn_out: &mut impl MidiOutput,
-  cmd_receiver: &Receiver<Cmd>,
-  clock: &impl Clock,
-) -> PlayResult {
-  let seq = play_state.play_cmd_data.seq;
-  
-  if let Some(result) = process_command(cmd_receiver, seq) {
-    return result;
-  }
-  
-  // Calculate current playback position from elapsed time
-  let current_position = calculate_current_position(play_state, clock);
-  
-  // Find the index of events to process
-  let next_idx: usize = match play_state.play_cmd_data.play_data.midi_data.find(&current_position) {
-    Ok(idx) => idx,
-    Err(idx) => idx,
-  };
-  
-  // Send MIDI events
-  if let Err(result) = send_midi_events(play_state, next_idx, conn_out, seq) {
-    return result;
-  }
-  
-  // Wait for next event or finish
-  wait_for_next_event(play_state, next_idx, clock)
-}
-
-fn resp(resp_sender: &SyncSender<Resp>, resp: Resp) {
-  if let Err(e) = resp_sender.send(resp) {
-    println!("Cannot send response: {:?}.", e);
-  }
 }
 
 #[cfg(test)]
@@ -425,7 +447,7 @@ mod tests {
     #[test]
     fn test_play_single_note() {
         // Setup
-        let mut midi_output = MockMidiOutput::new();
+        let midi_output = MockMidiOutput::new();
         let (_cmd_sender, cmd_receiver) = mpsc::sync_channel::<Cmd>(1);
         let (_resp_sender, _resp_receiver) = mpsc::sync_channel::<Resp>(1);
 
@@ -457,12 +479,11 @@ mod tests {
         ]);
 
         // Execute play_cycle
-        let result = play_cycle(
-            &mut play_state,
-            &mut midi_output,
-            &cmd_receiver,
-            &clock,
-        );
+        let mut player_task = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock);
+        let result = player_task.play_cycle(&mut play_state);
+        
+        // Take back the components for verification
+        let (_, midi_output, _, _, clock) = player_task.take();
 
         // Verify result - should continue (waiting for note off event)
         match result {
@@ -472,7 +493,7 @@ mod tests {
             PlayResult::Finished => panic!("Got PlayResult::Finished, expected Continue"),
             PlayResult::Stopped => panic!("Got PlayResult::Stopped"),
             PlayResult::Interrupted(_) => panic!("Got PlayResult::Interrupted"),
-            PlayResult::Error(msg) => panic!("Got PlayResult::Error"),
+            PlayResult::Error(_msg) => panic!("Got PlayResult::Error"),
         }
 
         // Verify MIDI messages were sent
@@ -493,10 +514,9 @@ mod tests {
     #[test]
     fn test_run_iteration_play_command_when_idle() {
         // Setup
-        let mut midi_output = MockMidiOutput::new();
+        let midi_output = MockMidiOutput::new();
         let (cmd_sender, cmd_receiver) = mpsc::sync_channel(1);
         let (resp_sender, resp_receiver) = mpsc::sync_channel(1);
-        let mut current_play_state: Option<PlayState> = None;
 
         // Create test PlayData
         let play_data = create_empty_play_data();
@@ -514,21 +534,16 @@ mod tests {
         let base_time = Instant::now();
         let clock = MockClock::new(vec![base_time]);
 
-        // Execute run_iteration
-        let should_continue = run_iteration(
-            &mut current_play_state,
-            &mut midi_output,
-            &cmd_receiver,
-            &resp_sender,
-            &clock,
-        );
+        // Create PlayerTask and execute run_iteration
+        let mut player_task = PlayerTask::new(midi_output, cmd_receiver, resp_sender, clock);
+        let should_continue = player_task.run_iteration();
 
         // Verify results
         assert!(should_continue, "run_iteration should return true to continue");
         
         // Verify that play state was created
-        assert!(current_play_state.is_some(), "PlayState should be created");
-        let play_state = current_play_state.as_ref().unwrap();
+        assert!(player_task.play_state.is_some(), "PlayState should be created");
+        let play_state = player_task.play_state.as_ref().unwrap();
         assert_eq!(play_state.play_cmd_data.seq, 1);
         assert_eq!(play_state.cycle_offset, 0);
 
@@ -540,7 +555,7 @@ mod tests {
     #[test]
     fn test_play_cycle_with_mock_clock() {
         // Setup
-        let mut midi_output = MockMidiOutput::new();
+        let midi_output = MockMidiOutput::new();
         let (_cmd_sender, cmd_receiver) = mpsc::sync_channel::<Cmd>(1);
         let (_resp_sender, _resp_receiver) = mpsc::sync_channel::<Resp>(1);
 
@@ -565,12 +580,12 @@ mod tests {
         let clock = MockClock::new(vec![base_time]);
 
         // Execute play_cycle
-        let result = play_cycle(
-            &mut play_state,
-            &mut midi_output,
-            &cmd_receiver,
-            &clock,
-        );
+        let (_resp_sender, _resp_receiver) = mpsc::sync_channel::<Resp>(1);
+        let mut player_task = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock);
+        let result = player_task.play_cycle(&mut play_state);
+        
+        // Take back the components for verification
+        let (_, _, _, _, clock) = player_task.take();
 
         // Verify result - empty PlayData should finish immediately
         match result {
@@ -580,7 +595,7 @@ mod tests {
             PlayResult::Continue => panic!("Got PlayResult::Continue"),
             PlayResult::Stopped => panic!("Got PlayResult::Stopped"),
             PlayResult::Interrupted(_) => panic!("Got PlayResult::Interrupted"),
-            PlayResult::Error(msg) => panic!("Got PlayResult::Error"),
+            PlayResult::Error(_msg) => panic!("Got PlayResult::Error"),
         }
 
         // Verify no sleep was called (finished before sleep)
@@ -591,7 +606,7 @@ mod tests {
     #[test]
     fn test_play_cycle_stop_command() {
         // Setup
-        let mut midi_output = MockMidiOutput::new();
+        let midi_output = MockMidiOutput::new();
         let (cmd_sender, cmd_receiver) = mpsc::sync_channel::<Cmd>(1);
 
         // Create test PlayData
@@ -618,12 +633,9 @@ mod tests {
         let clock = MockClock::new(vec![]);
 
         // Execute play_cycle
-        let result = play_cycle(
-            &mut play_state,
-            &mut midi_output,
-            &cmd_receiver,
-            &clock,
-        );
+        let (_resp_sender, _resp_receiver) = mpsc::sync_channel::<Resp>(1);
+        let mut player_task = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock);
+        let result = player_task.play_cycle(&mut play_state);
 
         // Verify result - play_cycle should return Stopped
         // Note: Response sending is handled by handle_playing_state, not play_cycle
@@ -637,7 +649,7 @@ mod tests {
 
     #[test]
     fn test_play_cycle_note_on_and_off_boundary() {
-        let mut midi_output = MockMidiOutput::new();
+        let midi_output = MockMidiOutput::new();
         let (_cmd_sender, cmd_receiver) = mpsc::sync_channel::<Cmd>(1);
         let (_resp_sender, _resp_receiver) = mpsc::sync_channel::<Resp>(1);
 
@@ -665,12 +677,12 @@ mod tests {
             base_time + Duration::from_nanos(CYCLE_DURATION_NANOS + 2),
         ]);
 
-        let result1 = play_cycle(
-            &mut play_state,
-            &mut midi_output,
-            &cmd_receiver,
-            &clock1,
-        );
+        let (_resp_sender, _resp_receiver) = mpsc::sync_channel::<Resp>(1);
+        let mut player_task1 = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock1);
+        let result1 = player_task1.play_cycle(&mut play_state);
+        
+        // Take back the components for next test
+        let (_, midi_output, cmd_receiver, _resp_sender, clock1) = player_task1.take();
 
         assert!(matches!(result1, PlayResult::Continue), "Should continue after Note On");
         assert_eq!(midi_output.sent_messages.len(), 1, "Should have sent Note On");
@@ -690,12 +702,11 @@ mod tests {
             base_time + Duration::from_nanos(note_off_cycle * CYCLE_DURATION_NANOS + 1),
         ]);
 
-        let result2 = play_cycle(
-            &mut play_state,
-            &mut midi_output,
-            &cmd_receiver,
-            &clock2,
-        );
+        let mut player_task2 = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock2);
+        let result2 = player_task2.play_cycle(&mut play_state);
+        
+        // Take back the components for next test
+        let (_, midi_output, cmd_receiver, _resp_sender, clock2) = player_task2.take();
 
         assert!(matches!(result2, PlayResult::Continue), "Should continue at exact boundary");
         assert_eq!(midi_output.sent_messages.len(), 1, "Should NOT have sent Note Off at exact boundary");
@@ -713,12 +724,11 @@ mod tests {
             base_time + Duration::from_nanos((note_off_cycle + 1) * CYCLE_DURATION_NANOS + 1),
         ]);
 
-        let result3 = play_cycle(
-            &mut play_state,
-            &mut midi_output,
-            &cmd_receiver,
-            &clock3,
-        );
+        let mut player_task3 = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock3);
+        let result3 = player_task3.play_cycle(&mut play_state);
+        
+        // Take back the components for verification
+        let (_, midi_output, _, _, clock3) = player_task3.take();
 
         assert!(matches!(result3, PlayResult::Finished), "Should finish after Note Off");
         assert_eq!(midi_output.sent_messages.len(), 2, "Should have sent Note Off");
@@ -733,7 +743,7 @@ mod tests {
     #[test]
     fn test_play_cycle_with_non_zero_start_cycle() {
         // Setup
-        let mut midi_output = MockMidiOutput::new();
+        let midi_output = MockMidiOutput::new();
         let (_cmd_sender, cmd_receiver) = mpsc::sync_channel::<Cmd>(1);
         let (_resp_sender, _resp_receiver) = mpsc::sync_channel::<Resp>(1);
 
@@ -774,12 +784,12 @@ mod tests {
             base_time + Duration::from_nanos(CYCLE_DURATION_NANOS + 2),
         ]);
 
-        let result1 = play_cycle(
-            &mut play_state,
-            &mut midi_output,
-            &cmd_receiver,
-            &clock1,
-        );
+        let (_resp_sender, _resp_receiver) = mpsc::sync_channel::<Resp>(1);
+        let mut player_task1 = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock1);
+        let result1 = player_task1.play_cycle(&mut play_state);
+        
+        // Take back the components for next test
+        let (_, midi_output, cmd_receiver, _resp_sender, clock1) = player_task1.take();
 
         // Should continue (waiting for note_off)
         assert!(matches!(result1, PlayResult::Continue), "Should continue, waiting for note_off");
@@ -804,12 +814,11 @@ mod tests {
             base_time + Duration::from_nanos((note_off_cycle - start_cycle + 1) * CYCLE_DURATION_NANOS + 1),
         ]);
 
-        let result2 = play_cycle(
-            &mut play_state,
-            &mut midi_output,
-            &cmd_receiver,
-            &clock2,
-        );
+        let mut player_task2 = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock2);
+        let result2 = player_task2.play_cycle(&mut play_state);
+        
+        // Take back the components for verification
+        let (_, midi_output, _, _, clock2) = player_task2.take();
 
         // Should finish after sending note_off
         assert!(matches!(result2, PlayResult::Finished), "Should finish after note_off");
