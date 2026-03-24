@@ -1,12 +1,6 @@
 use klavier_core::repeat::AccumTick;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Status {
-    Stopped,
-    Playing,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum CmdInfo {
     PlayingEnded,
     CurrentLoc {
@@ -20,6 +14,5 @@ pub enum CmdInfo {
 pub enum Resp {
     Err { seq: usize, msg: String },
     Info { seq: usize, info: CmdInfo },
-    Ok { seq: usize, status: Status },
     Aborted,
 }

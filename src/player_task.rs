@@ -1,10 +1,7 @@
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
-use crate::play_resp::Status;
 use crate::{play_cmd::{Cmd, PlayCmdData}, play_resp::{Resp, CmdInfo}, midi_output::MidiOutput};
-
-const CYCLE_DURATION_NANOS: u64 = 1_000; // 1us = 1000ns
 
 /// Trait for abstracting time operations to enable testing
 trait Clock {
@@ -89,15 +86,16 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
   fn run_iteration(&mut self) -> bool {
     if let Some(play_state) = self.play_state.take() {
       // If playing, perform playback
-      self.handle_playing_state(play_state);
+      self.handle_playing_state(play_state)
     } else {
       // If not playing, wait for a command (blocking)
-      self.handle_idle_state();
+      self.handle_idle_state()
     }
-    self.play_state.is_some()
   }
 
-  fn handle_idle_state(&mut self) {
+  /// Handle idle state (not playing).
+  /// Returns `true` to continue the loop, `false` to exit.
+  fn handle_idle_state(&mut self) -> bool {
     match self.cmd_receiver.recv() {
       Ok(Cmd::Play(play_cmd_data)) => {
         info!("Play command received: seq={}, start_cycle={}", play_cmd_data.seq, play_cmd_data.start_cycle);
@@ -112,23 +110,46 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
           start_timestamp: self.clock.now(),
           current_idx: start_idx,
         });
-        self.resp(Resp::Ok { seq: self.play_state.as_ref().unwrap().play_cmd_data.seq, status: Status::Playing });
+        let play_state = self.play_state.as_ref().unwrap();
+        let start_cycle = play_state.play_cmd_data.start_cycle;
+        let accum_tick = play_state.play_cmd_data.play_data.cycle_to_tick(start_cycle, crate::SAMPLING_RATE_U32);
+        let tick = play_state.play_cmd_data.play_data.accum_tick_to_tick(accum_tick);
+        self.resp(Resp::Info {
+          seq: play_state.play_cmd_data.seq,
+          info: CmdInfo::CurrentLoc {
+            seq: play_state.play_cmd_data.seq,
+            tick,
+            accum_tick,
+          }
+        });
+        true // Continue the loop
       }
       Ok(Cmd::Stop { seq }) => {
         error!("Already stopped, just ignored: seq={}", seq);
-        self.resp(Resp::Ok { seq, status: Status::Stopped });
+        self.resp(Resp::Info { seq, info: CmdInfo::PlayingEnded });
+        true // Continue the loop
+      }
+      Ok(Cmd::Terminate) => {
+        info!("Terminate command received while idle, shutting down gracefully");
+        self.resp(Resp::Aborted);
+        self.play_state.take();
+        false // Exit the loop
       }
       Err(e) => {
         error!("Player task cannot receive command: {:?}", e);
         self.play_state.take();
+        false // Exit the loop on error
       }
     }
   }
 
-  fn handle_playing_state(&mut self, mut play_state: PlayState) {
+  /// Handle playing state.
+  /// Returns `true` to continue the loop, `false` to exit.
+  fn handle_playing_state(&mut self, mut play_state: PlayState) -> bool {
     match self.play_cycle(&mut play_state) {
       PlayResult::Continue => {
         self.play_state = Some(play_state);
+        true // Continue the loop
       }
       PlayResult::Finished => {
         info!("Playback finished: seq={}", play_state.play_cmd_data.seq);
@@ -136,10 +157,12 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
           seq: play_state.play_cmd_data.seq,
           info: CmdInfo::PlayingEnded
         });
+        true // Continue the loop (wait for next command)
       }
       PlayResult::Stopped => {
         info!("Playback stopped: seq={}", play_state.play_cmd_data.seq);
-        self.resp(Resp::Ok { seq: play_state.play_cmd_data.seq, status: Status::Stopped });
+        self.resp(Resp::Info { seq: play_state.play_cmd_data.seq, info: CmdInfo::PlayingEnded });
+        true // Continue the loop (wait for next command)
       }
       PlayResult::Interrupted(new_play_cmd_data) => {
         info!("Playback interrupted: old_seq={}, new_seq={}", play_state.play_cmd_data.seq, new_play_cmd_data.seq);
@@ -154,12 +177,30 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
           start_timestamp: self.clock.now(),
           current_idx: start_idx,
         });
-        self.resp(Resp::Ok { seq: self.play_state.as_ref().unwrap().play_cmd_data.seq, status: Status::Playing });
+        let play_state = self.play_state.as_ref().unwrap();
+        let start_cycle = play_state.play_cmd_data.start_cycle;
+        let accum_tick = play_state.play_cmd_data.play_data.cycle_to_tick(start_cycle, crate::SAMPLING_RATE_U32);
+        let tick = play_state.play_cmd_data.play_data.accum_tick_to_tick(accum_tick);
+        self.resp(Resp::Info {
+          seq: play_state.play_cmd_data.seq,
+          info: CmdInfo::CurrentLoc {
+            seq: play_state.play_cmd_data.seq,
+            tick,
+            accum_tick,
+          }
+        });
+        true // Continue the loop
       }
       PlayResult::Error(msg) => {
         let seq = play_state.play_cmd_data.seq;
         error!("Playback error(seq={}): {}", seq, msg);
         self.resp(Resp::Err { seq, msg });
+        false // Exit the loop on error
+      }
+      PlayResult::Terminated => {
+        info!("Playback terminated gracefully: seq={}", play_state.play_cmd_data.seq);
+        self.resp(Resp::Aborted);
+        false // Exit the loop
       }
     }
   }
@@ -185,6 +226,18 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
       return result;
     }
     
+    // Send current location info for tracker (use try_send to avoid blocking)
+    let accum_tick = play_state.play_cmd_data.play_data.cycle_to_tick(current_position, crate::SAMPLING_RATE_U32);
+    let tick = play_state.play_cmd_data.play_data.accum_tick_to_tick(accum_tick);
+    let _ = self.resp_sender.try_send(Resp::Info {
+      seq,
+      info: CmdInfo::CurrentLoc {
+        seq,
+        tick,
+        accum_tick,
+      }
+    });
+    
     // Wait for next event or finish
     self.wait_for_next_event(play_state, next_idx)
   }
@@ -207,6 +260,10 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
         info!("Play command received while already playing, interrupting current playback");
         Some(PlayResult::Interrupted(Box::new(new_play_cmd_data)))
       }
+      Ok(Cmd::Terminate) => {
+        info!("Terminate command received while playing, shutting down gracefully");
+        Some(PlayResult::Terminated)
+      }
       Err(TryRecvError::Empty) => {
         // No command, continue playing
         None
@@ -223,7 +280,7 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
   fn calculate_current_position(&self, play_state: &PlayState) -> u64 {
     let now = self.clock.now();
     let elapsed = now.duration_since(play_state.start_timestamp);
-    let elapsed_cycles = elapsed.as_nanos() / CYCLE_DURATION_NANOS as u128;
+    let elapsed_cycles = elapsed.as_nanos() / crate::CYCLE_DURATION_NANOS as u128;
     play_state.cycle_offset + elapsed_cycles as u64
   }
 
@@ -263,7 +320,7 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
       let now = self.clock.now();
       let (next_cycle, _) = play_state.play_cmd_data.play_data.midi_data[next_idx];
       let cycles_from_start = next_cycle.saturating_sub(play_state.cycle_offset);
-      let target_time = play_state.start_timestamp + Duration::from_nanos(cycles_from_start * CYCLE_DURATION_NANOS);
+      let target_time = play_state.start_timestamp + Duration::from_nanos(cycles_from_start * crate::CYCLE_DURATION_NANOS);
       let sleep_duration = target_time - now;
       self.clock.sleep(sleep_duration);
       PlayResult::Continue
@@ -298,6 +355,7 @@ enum PlayResult {
   Stopped,
   Interrupted(Box<PlayCmdData>),
   Error(String),
+  Terminated,
 }
 
 #[cfg(test)]
@@ -378,12 +436,12 @@ mod tests {
         ).unwrap();
         
         let cycles_by_tick = events.cycles_by_accum_tick(
-            1_000_000,
+            crate::SAMPLING_RATE_U32,
             klavier_core::duration::Duration::TICK_RESOLUTION as u32
         );
         events.to_play_data(
             cycles_by_tick,
-            1_000_000,
+            crate::SAMPLING_RATE_U32,
             klavier_core::duration::Duration::TICK_RESOLUTION as u32
         )
     }
@@ -434,12 +492,12 @@ mod tests {
         ).unwrap();
         
         let cycles_by_tick = events.cycles_by_accum_tick(
-            1_000_000,
+            crate::SAMPLING_RATE_U32,
             klavier_core::duration::Duration::TICK_RESOLUTION as u32
         );
         events.to_play_data(
             cycles_by_tick,
-            1_000_000,
+            crate::SAMPLING_RATE_U32,
             klavier_core::duration::Duration::TICK_RESOLUTION as u32
         )
     }
@@ -494,6 +552,7 @@ mod tests {
             PlayResult::Stopped => panic!("Got PlayResult::Stopped"),
             PlayResult::Interrupted(_) => panic!("Got PlayResult::Interrupted"),
             PlayResult::Error(_msg) => panic!("Got PlayResult::Error"),
+            PlayResult::Terminated => panic!("Got PlayResult::Terminated"),
         }
 
         // Verify MIDI messages were sent
@@ -509,6 +568,76 @@ mod tests {
         // Verify sleep was called (waiting for next event)
         let sleep_calls = clock.sleep_calls();
         assert_eq!(sleep_calls.len(), 1, "Expected one sleep call");
+    }
+
+    #[test]
+    fn test_play_cycle_sends_current_loc() {
+        // Setup
+        let midi_output = MockMidiOutput::new();
+        let (_cmd_sender, cmd_receiver) = mpsc::sync_channel::<Cmd>(1);
+        let (resp_sender, resp_receiver) = mpsc::sync_channel::<Resp>(64); // Larger buffer to receive CurrentLoc
+
+        // Create test PlayData with a single note
+        let play_data = create_single_note_play_data();
+        let play_cmd_data = PlayCmdData {
+            seq: 1,
+            play_data: play_data.clone(),
+            start_cycle: 0,
+        };
+
+        // Create PlayState
+        let base_time = Instant::now();
+        let mut play_state = PlayState {
+            play_cmd_data,
+            cycle_offset: 0,
+            start_timestamp: base_time,
+            current_idx: 0,
+        };
+
+        // Create mock clock
+        let clock = MockClock::new(vec![
+            base_time + Duration::from_micros(2),   // Initial now() call
+            base_time + Duration::from_micros(3),   // For sleep duration calculation
+        ]);
+
+        // Execute play_cycle
+        let mut player_task = PlayerTask::new(midi_output, cmd_receiver, resp_sender, clock);
+        let result = player_task.play_cycle(&mut play_state);
+        
+        // Verify result
+        match result {
+            PlayResult::Continue => {
+                // Expected - there should be more events (note off)
+            }
+            PlayResult::Finished => panic!("Expected PlayResult::Continue, got Finished"),
+            PlayResult::Stopped => panic!("Expected PlayResult::Continue, got Stopped"),
+            PlayResult::Interrupted(_) => panic!("Expected PlayResult::Continue, got Interrupted"),
+            PlayResult::Error(msg) => panic!("Expected PlayResult::Continue, got Error: {}", msg),
+            PlayResult::Terminated => panic!("Expected PlayResult::Continue, got Terminated"),
+        }
+
+        // Verify CurrentLoc was sent
+        match resp_receiver.try_recv() {
+            Ok(Resp::Info { seq, info }) => {
+                assert_eq!(seq, 1, "Sequence number should match");
+                match info {
+                    CmdInfo::CurrentLoc { seq: loc_seq, tick, accum_tick } => {
+                        assert_eq!(loc_seq, 1, "CurrentLoc seq should match");
+                        
+                        // Verify tick values are calculated correctly
+                        let current_position = 2; // Based on mock clock time
+                        let expected_accum_tick = play_data.cycle_to_tick(current_position, crate::SAMPLING_RATE_U32);
+                        let expected_tick = play_data.accum_tick_to_tick(expected_accum_tick);
+                        
+                        assert_eq!(accum_tick, expected_accum_tick, "accum_tick should match");
+                        assert_eq!(tick, expected_tick, "tick should match");
+                    }
+                    _ => panic!("Expected CmdInfo::CurrentLoc, got {:?}", info),
+                }
+            }
+            Ok(resp) => panic!("Expected Resp::Info with CurrentLoc, got {:?}", resp),
+            Err(e) => panic!("Expected to receive CurrentLoc, but got error: {:?}", e),
+        }
     }
 
     #[test]
@@ -549,7 +678,64 @@ mod tests {
 
         // Verify response was sent
         let resp = resp_receiver.try_recv().unwrap();
-        assert_eq!(resp, Resp::Ok { seq: 1, status: Status::Playing });
+        if let Resp::Info { seq, info: CmdInfo::CurrentLoc { seq: loc_seq, tick, accum_tick } } = resp {
+            assert_eq!(seq, 1);
+            assert_eq!(loc_seq, 1);
+            // For start_cycle = 0, both tick and accum_tick should be 0
+            assert_eq!(tick, 0, "tick should be 0 for start_cycle = 0");
+            assert_eq!(accum_tick, 0, "accum_tick should be 0 for start_cycle = 0");
+        } else {
+            panic!("Expected Resp::Info with CmdInfo::CurrentLoc, got {:?}", resp);
+        }
+    }
+
+    #[test]
+    fn test_run_iteration_play_command_with_non_zero_start_cycle() {
+        // Setup
+        let midi_output = MockMidiOutput::new();
+        let (cmd_sender, cmd_receiver) = mpsc::sync_channel(1);
+        let (resp_sender, resp_receiver) = mpsc::sync_channel(1);
+
+        // Create test PlayData with a single note
+        let play_data = create_single_note_play_data();
+
+        // Start from a non-zero cycle to test tick/accum_tick calculation
+        let start_cycle = 1000;
+        let play_cmd_data = PlayCmdData {
+            seq: 2,
+            play_data: play_data.clone(),
+            start_cycle,
+        };
+
+        // Send Play command
+        cmd_sender.send(Cmd::Play(play_cmd_data)).unwrap();
+
+        // Create mock clock
+        let base_time = Instant::now();
+        let clock = MockClock::new(vec![base_time]);
+
+        // Create PlayerTask and execute run_iteration
+        let mut player_task = PlayerTask::new(midi_output, cmd_receiver, resp_sender, clock);
+        let should_continue = player_task.run_iteration();
+
+        // Verify results
+        assert!(should_continue, "run_iteration should return true to continue");
+        
+        // Verify response was sent
+        let resp = resp_receiver.try_recv().unwrap();
+        if let Resp::Info { seq, info: CmdInfo::CurrentLoc { seq: loc_seq, tick, accum_tick } } = resp {
+            assert_eq!(seq, 2);
+            assert_eq!(loc_seq, 2);
+            
+            // Calculate expected values
+            let expected_accum_tick = play_data.cycle_to_tick(start_cycle, crate::SAMPLING_RATE_U32);
+            let expected_tick = play_data.accum_tick_to_tick(expected_accum_tick);
+            
+            assert_eq!(accum_tick, expected_accum_tick, "accum_tick should match cycle_to_tick result");
+            assert_eq!(tick, expected_tick, "tick should match accum_tick_to_tick result");
+        } else {
+            panic!("Expected Resp::Info with CmdInfo::CurrentLoc, got {:?}", resp);
+        }
     }
 
     #[test]
@@ -596,6 +782,7 @@ mod tests {
             PlayResult::Stopped => panic!("Got PlayResult::Stopped"),
             PlayResult::Interrupted(_) => panic!("Got PlayResult::Interrupted"),
             PlayResult::Error(_msg) => panic!("Got PlayResult::Error"),
+            PlayResult::Terminated => panic!("Got PlayResult::Terminated"),
         }
 
         // Verify no sleep was called (finished before sleep)
@@ -673,8 +860,8 @@ mod tests {
 
         // Test 1: At cycle 1 (just past cycle 0) - should send Note On
         let clock1 = MockClock::new(vec![
-            base_time + Duration::from_nanos(CYCLE_DURATION_NANOS + 1),  // current_position = 1
-            base_time + Duration::from_nanos(CYCLE_DURATION_NANOS + 2),
+            base_time + Duration::from_nanos(crate::CYCLE_DURATION_NANOS + 1),  // current_position = 1
+            base_time + Duration::from_nanos(crate::CYCLE_DURATION_NANOS + 2),
         ]);
 
         let (_resp_sender, _resp_receiver) = mpsc::sync_channel::<Resp>(1);
@@ -692,14 +879,14 @@ mod tests {
         // Verify sleep was called with correct duration (until note_off_cycle)
         let sleep_calls = clock1.sleep_calls();
         assert_eq!(sleep_calls.len(), 1, "Should have called sleep once");
-        let expected_sleep_nanos = note_off_cycle * CYCLE_DURATION_NANOS - (CYCLE_DURATION_NANOS + 2);
+        let expected_sleep_nanos = note_off_cycle * crate::CYCLE_DURATION_NANOS - (crate::CYCLE_DURATION_NANOS + 2);
         assert_eq!(sleep_calls[0].as_nanos(), expected_sleep_nanos as u128,
             "Sleep duration should be {} nanoseconds", expected_sleep_nanos);
 
         // Test 2: At exactly note_off_cycle - should NOT send Note Off yet
         let clock2 = MockClock::new(vec![
-            base_time + Duration::from_nanos(note_off_cycle * CYCLE_DURATION_NANOS),
-            base_time + Duration::from_nanos(note_off_cycle * CYCLE_DURATION_NANOS + 1),
+            base_time + Duration::from_nanos(note_off_cycle * crate::CYCLE_DURATION_NANOS),
+            base_time + Duration::from_nanos(note_off_cycle * crate::CYCLE_DURATION_NANOS + 1),
         ]);
 
         let mut player_task2 = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock2);
@@ -720,8 +907,8 @@ mod tests {
 
         // Test 3: At note_off_cycle + 1 - should send Note Off
         let clock3 = MockClock::new(vec![
-            base_time + Duration::from_nanos((note_off_cycle + 1) * CYCLE_DURATION_NANOS),
-            base_time + Duration::from_nanos((note_off_cycle + 1) * CYCLE_DURATION_NANOS + 1),
+            base_time + Duration::from_nanos((note_off_cycle + 1) * crate::CYCLE_DURATION_NANOS),
+            base_time + Duration::from_nanos((note_off_cycle + 1) * crate::CYCLE_DURATION_NANOS + 1),
         ]);
 
         let mut player_task3 = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock3);
@@ -780,8 +967,8 @@ mod tests {
         // Since note_on is at cycle 0, which is < start_cycle (500), it should already be processed
         // We should be waiting for note_off at cycle 1000000
         let clock1 = MockClock::new(vec![
-            base_time + Duration::from_nanos(CYCLE_DURATION_NANOS + 1),  // elapsed = 1001ns, current_position = 500 + 1 = 501
-            base_time + Duration::from_nanos(CYCLE_DURATION_NANOS + 2),
+            base_time + Duration::from_nanos(crate::CYCLE_DURATION_NANOS + 1),  // elapsed = 1001ns, current_position = 500 + 1 = 501
+            base_time + Duration::from_nanos(crate::CYCLE_DURATION_NANOS + 2),
         ]);
 
         let (_resp_sender, _resp_receiver) = mpsc::sync_channel::<Resp>(1);
@@ -800,18 +987,18 @@ mod tests {
         // Verify sleep was called (waiting for note_off at cycle 1000000)
         let sleep_calls = clock1.sleep_calls();
         assert_eq!(sleep_calls.len(), 1, "Should have called sleep once");
-        // target_time = base_time + (note_off_cycle - start_cycle) * CYCLE_DURATION_NANOS
+        // target_time = base_time + (note_off_cycle - start_cycle) * crate::CYCLE_DURATION_NANOS
         //             = base_time + (1000000 - 500) * 1000
         // now = base_time + 1002ns
         // sleep_duration = target_time - now = (1000000 - 500) * 1000 - 1002
-        let expected_sleep = (note_off_cycle - start_cycle) * CYCLE_DURATION_NANOS - (CYCLE_DURATION_NANOS + 2);
+        let expected_sleep = (note_off_cycle - start_cycle) * crate::CYCLE_DURATION_NANOS - (crate::CYCLE_DURATION_NANOS + 2);
         assert_eq!(sleep_calls[0].as_nanos(), expected_sleep as u128,
             "Sleep duration should be {} nanoseconds", expected_sleep);
 
         // Test 2: Advance past note_off_cycle to send Note Off
         let clock2 = MockClock::new(vec![
-            base_time + Duration::from_nanos((note_off_cycle - start_cycle + 1) * CYCLE_DURATION_NANOS),
-            base_time + Duration::from_nanos((note_off_cycle - start_cycle + 1) * CYCLE_DURATION_NANOS + 1),
+            base_time + Duration::from_nanos((note_off_cycle - start_cycle + 1) * crate::CYCLE_DURATION_NANOS),
+            base_time + Duration::from_nanos((note_off_cycle - start_cycle + 1) * crate::CYCLE_DURATION_NANOS + 1),
         ]);
 
         let mut player_task2 = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock2);
@@ -831,5 +1018,72 @@ mod tests {
         // No sleep should be called (finished)
         let sleep_calls = clock2.sleep_calls();
         assert_eq!(sleep_calls.len(), 0, "Should not call sleep when finished");
+    }
+
+    #[test]
+    fn test_stop_then_play_again() {
+        // Setup
+        let midi_output = MockMidiOutput::new();
+        let (cmd_sender, cmd_receiver) = mpsc::sync_channel(10);
+        let (resp_sender, resp_receiver) = mpsc::sync_channel(10);
+
+        // Create test PlayData
+        let play_data = create_empty_play_data();
+
+        // Create mock clock
+        let base_time = Instant::now();
+        let clock = MockClock::new(vec![
+            base_time,  // For first play command
+            base_time,  // For second play command
+        ]);
+
+        // Create PlayerTask
+        let mut player_task = PlayerTask::new(midi_output, cmd_receiver, resp_sender, clock);
+
+        // Send first Play command
+        let play_cmd_data1 = PlayCmdData {
+            seq: 1,
+            play_data: play_data.clone(),
+            start_cycle: 0,
+        };
+        cmd_sender.send(Cmd::Play(play_cmd_data1)).unwrap();
+
+        // Execute first iteration (should start playing)
+        let should_continue = player_task.run_iteration();
+        assert!(should_continue, "Should continue after first play");
+        assert!(player_task.play_state.is_some(), "Should be in playing state");
+
+        // Verify first play response
+        let resp1 = resp_receiver.try_recv().unwrap();
+        assert!(matches!(resp1, Resp::Info { seq: 1, .. }), "Should receive play info for seq 1");
+
+        // Send Stop command
+        cmd_sender.send(Cmd::Stop { seq: 1 }).unwrap();
+
+        // Execute iteration (should stop)
+        let should_continue = player_task.run_iteration();
+        assert!(should_continue, "Should continue after stop");
+        assert!(player_task.play_state.is_none(), "Should be in idle state after stop");
+
+        // Verify stop response
+        let resp2 = resp_receiver.try_recv().unwrap();
+        assert!(matches!(resp2, Resp::Info { seq: 1, info: CmdInfo::PlayingEnded }), "Should receive stop info");
+
+        // Send second Play command (this should work without showing MIDI dialog)
+        let play_cmd_data2 = PlayCmdData {
+            seq: 2,
+            play_data,
+            start_cycle: 0,
+        };
+        cmd_sender.send(Cmd::Play(play_cmd_data2)).unwrap();
+
+        // Execute iteration (should start playing again)
+        let should_continue = player_task.run_iteration();
+        assert!(should_continue, "Should continue after second play");
+        assert!(player_task.play_state.is_some(), "Should be in playing state again");
+
+        // Verify second play response
+        let resp3 = resp_receiver.try_recv().unwrap();
+        assert!(matches!(resp3, Resp::Info { seq: 2, .. }), "Should receive play info for seq 2");
     }
 }

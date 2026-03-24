@@ -19,8 +19,6 @@ pub struct Player {
 }
 
 impl Player {
-    const SAMPLING_RATE: usize = 1000 * 1000; // 1us
-    
     /// Create a new Player with a real MIDI connection
     pub fn new(tick_resolution: u32, midi_conn: MidiOutputConnection) -> Self {
         Self::new_with_output(tick_resolution, RealMidiOutput::new(midi_conn))
@@ -81,7 +79,7 @@ impl Player {
         .map_err(|e| Report::new(PlayError::RenderError(e.current_context().clone())))?;
 
         let cycles_by_tick: Store<u32, (TempoValue, u64), ()>
-          = events.cycles_by_accum_tick(Self::SAMPLING_RATE, self.tick_resolution);
+          = events.cycles_by_accum_tick(crate::SAMPLING_RATE_U32, self.tick_resolution);
 
         let start_accum_tick: u32 = match play_start_loc {
             None => 0,
@@ -95,12 +93,12 @@ impl Player {
         let start_cycle: u64 = {
             match cycles_by_tick.just_before(start_accum_tick).next() {
                 Some((t, (tempo, cycles))) =>
-                    *cycles + MidiEvents::tick_to_cycle(start_accum_tick - *t, Self::SAMPLING_RATE, tempo.as_u16(), Duration::TICK_RESOLUTION as u32),
+                    *cycles + MidiEvents::tick_to_cycle(start_accum_tick - *t, crate::SAMPLING_RATE_U32, tempo.as_u16(), Duration::TICK_RESOLUTION as u32),
                 None =>
-                    MidiEvents::tick_to_cycle(start_accum_tick, Self::SAMPLING_RATE, TempoValue::default().as_u16(), Duration::TICK_RESOLUTION as u32),
+                    MidiEvents::tick_to_cycle(start_accum_tick, crate::SAMPLING_RATE_U32, TempoValue::default().as_u16(), Duration::TICK_RESOLUTION as u32),
             }
         };
-        let play_data: PlayData = events.to_play_data(cycles_by_tick, Self::SAMPLING_RATE, Duration::TICK_RESOLUTION as u32);
+        let play_data: PlayData = events.to_play_data(cycles_by_tick, crate::SAMPLING_RATE_U32, Duration::TICK_RESOLUTION as u32);
         
         // Send play command to player task
         let play_cmd = Cmd::Play(PlayCmdData {
@@ -123,7 +121,17 @@ impl Player {
         
         Ok(())
     }
-
+    
+    /// Gracefully terminate the player task.
+    /// This sends a Terminate command to cleanly shut down the player thread.
+    pub fn terminate(&mut self) -> Result<(), Report<PlayError>> {
+        let terminate_cmd = Cmd::Terminate;
+        
+        self.cmd_channel.send(terminate_cmd)
+            .map_err(|e| Report::new(PlayError::SendCommandError(format!("{:?}", e))))?;
+        
+        Ok(())
+    }
 }
 
 #[cfg(test)]

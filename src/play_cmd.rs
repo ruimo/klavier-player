@@ -13,6 +13,7 @@ pub enum Cmd {
     Stop {
         seq: usize,
     },
+    Terminate,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
