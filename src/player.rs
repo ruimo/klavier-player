@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::{Arc, Mutex, mpsc::{Receiver, SyncSender, sync_channel}}};
+use std::{rc::Rc, sync::{mpsc::{Receiver, SyncSender, sync_channel}}};
 
 use error_stack::Report;
 use klavier_core::{bar::Bar, ctrl_chg::CtrlChg, duration::Duration, global_repeat::RenderRegionWarning, key::Key, midi_events::{MidiEvents, PlayData, create_midi_events}, note::Note, play_start_tick::PlayStartTick, project::ModelChangeMetadata, rhythm::Rhythm, tempo::{Tempo, TempoValue}};

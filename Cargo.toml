@@ -11,7 +11,7 @@ repository = "https://github.com/ruimo/klavier-player"
 [dependencies]
 klavier-helper = "0.1.11"
 #klavier-helper = { path = "../klavier-helper" }
-klavier-core = "0.1.14"
+klavier-core = "0.1.15"
 #klavier-core = { path = "../klavier-core" }
 error-stack = "^0"
 once_cell = "^1"

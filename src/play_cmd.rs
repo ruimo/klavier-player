@@ -15,8 +15,3 @@ pub enum Cmd {
     },
     Terminate,
 }
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum CmdError {
-    MidiWriteError(String),
-}

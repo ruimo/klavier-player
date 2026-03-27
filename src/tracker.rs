@@ -1,7 +1,7 @@
-use std::{mem::Discriminant, rc::Rc, sync::{Arc, Mutex, mpsc}, thread};
+use std::{rc::Rc, sync::{Arc, Mutex, mpsc}, thread};
 
 use error_stack::Report;
-use klavier_core::{bar::Bar, ctrl_chg::CtrlChg, global_repeat::RenderRegionWarning, key::Key, note::Note, play_start_tick::PlayStartTick, project::ModelChangeMetadata, repeat::AccumTick, rhythm::Rhythm, tempo::Tempo};
+use klavier_core::{bar::Bar, ctrl_chg::CtrlChg, global_repeat::RenderRegionWarning, key::Key, note::Note, play_start_tick::PlayStartTick, project::ModelChangeMetadata, rhythm::Rhythm, tempo::Tempo};
 use klavier_helper::{bag_store::BagStore, store::Store};
 use midir::MidiOutputConnection;
 use tracing::error;
