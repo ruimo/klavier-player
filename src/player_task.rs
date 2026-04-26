@@ -161,6 +161,7 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
       }
       PlayResult::Stopped => {
         info!("Playback stopped: seq={}", play_state.play_cmd_data.seq);
+        self.send_panic_messages();
         self.resp(Resp::Info { seq: play_state.play_cmd_data.seq, info: CmdInfo::PlayingEnded });
         true // Continue the loop (wait for next command)
       }
@@ -306,6 +307,36 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
     
     play_state.current_idx = next_idx;
     Ok(())
+  }
+
+  /// Send All Sound Off (CC 120) and pedal off messages for all channels
+  fn send_panic_messages(&mut self) {
+    info!("Sending panic messages (All Sound Off and pedals off)");
+    for channel in 0..16 {
+      // CC 120 (All Sound Off): 0xB0 | channel, 120, 0
+      let all_sound_off = [0xB0 | channel, 120, 0];
+      if let Err(e) = self.midi_conn.send(&all_sound_off) {
+        warn!("Failed to send All Sound Off for channel {}: {:?}", channel, e);
+      }
+      
+      // CC 64 (Sustain/Damper pedal): 0xB0 | channel, 64, 0
+      let sustain = [0xB0 | channel, 64, 0];
+      if let Err(e) = self.midi_conn.send(&sustain) {
+        warn!("Failed to send sustain off for channel {}: {:?}", channel, e);
+      }
+      
+      // CC 66 (Sostenuto pedal): 0xB0 | channel, 66, 0
+      let sostenuto = [0xB0 | channel, 66, 0];
+      if let Err(e) = self.midi_conn.send(&sostenuto) {
+        warn!("Failed to send sostenuto off for channel {}: {:?}", channel, e);
+      }
+      
+      // CC 67 (Soft pedal): 0xB0 | channel, 67, 0
+      let soft = [0xB0 | channel, 67, 0];
+      if let Err(e) = self.midi_conn.send(&soft) {
+        warn!("Failed to send soft pedal off for channel {}: {:?}", channel, e);
+      }
+    }
   }
 
   /// Calculate and execute sleep until the next event
@@ -1170,5 +1201,110 @@ mod tests {
         // Verify that Note Off was NOT sent (stopped before reaching it)
         // Only Note On should have been sent in the first cycle
         assert_eq!(midi_output.sent_messages.len(), 1, "Should still have only Note On (no Note Off after stop)");
+    }
+
+    #[test]
+    fn test_stop_command_sends_panic_messages() {
+        // This test verifies that All Sound Off (CC 120) and pedal off messages
+        // are sent when a stop command is received
+        
+        let midi_output = MockMidiOutput::new();
+        let (cmd_sender, cmd_receiver) = mpsc::sync_channel::<Cmd>(10);
+        let (resp_sender, resp_receiver) = mpsc::sync_channel::<Resp>(10);
+
+        // Create test PlayData with a single note
+        let play_data = create_single_note_play_data();
+        
+        let play_cmd_data = PlayCmdData {
+            seq: 1,
+            play_data,
+            start_cycle: 0,
+        };
+
+        // Create PlayerTask
+        let base_time = Instant::now();
+        let clock = MockClock::new(vec![
+            base_time,
+            base_time + Duration::from_nanos(crate::CYCLE_DURATION_NANOS),
+        ]);
+        
+        let mut player_task = PlayerTask::new(midi_output, cmd_receiver, resp_sender, clock);
+
+        // Send Play command
+        cmd_sender.send(Cmd::Play(play_cmd_data)).unwrap();
+
+        // Execute iteration (should start playing)
+        let should_continue = player_task.run_iteration();
+        assert!(should_continue, "Should continue after play");
+        assert!(player_task.play_state.is_some(), "Should be in playing state");
+
+        // Clear the initial response
+        let _ = resp_receiver.try_recv();
+
+        // Send Stop command
+        cmd_sender.send(Cmd::Stop { seq: 1 }).unwrap();
+
+        // Execute iteration (should stop and send panic messages)
+        let should_continue = player_task.run_iteration();
+        assert!(should_continue, "Should continue after stop");
+        assert!(player_task.play_state.is_none(), "Should be in idle state after stop");
+
+        // Take back the MIDI output to verify messages
+        let (_, midi_output, _, _, _) = player_task.take();
+
+        // Verify panic messages were sent
+        // Expected: Note On + (All Sound Off + 3 pedal off messages) * 16 channels = 1 + 64 = 65 messages
+        let panic_message_count = midi_output.sent_messages.iter()
+            .filter(|msg| {
+                // Check for CC messages (0xB0-0xBF)
+                let status = msg[0] & 0xF0;
+                if status == 0xB0 {
+                    let cc_num = msg[1];
+                    // CC 120 (All Sound Off), CC 64 (Sustain), CC 66 (Sostenuto), CC 67 (Soft)
+                    cc_num == 120 || cc_num == 64 || cc_num == 66 || cc_num == 67
+                } else {
+                    false
+                }
+            })
+            .count();
+
+        // Should have 4 messages per channel * 16 channels = 64 panic messages
+        assert_eq!(panic_message_count, 64, "Should have sent 64 panic messages (4 per channel * 16 channels)");
+
+        // Verify All Sound Off messages for all 16 channels
+        let all_sound_off_count = midi_output.sent_messages.iter()
+            .filter(|msg| {
+                let status = msg[0] & 0xF0;
+                status == 0xB0 && msg[1] == 120 && msg[2] == 0
+            })
+            .count();
+        assert_eq!(all_sound_off_count, 16, "Should have sent All Sound Off for all 16 channels");
+
+        // Verify sustain pedal off messages for all 16 channels
+        let sustain_off_count = midi_output.sent_messages.iter()
+            .filter(|msg| {
+                let status = msg[0] & 0xF0;
+                status == 0xB0 && msg[1] == 64 && msg[2] == 0
+            })
+            .count();
+        assert_eq!(sustain_off_count, 16, "Should have sent sustain off for all 16 channels");
+
+        // Verify sostenuto pedal off messages for all 16 channels
+        let sostenuto_off_count = midi_output.sent_messages.iter()
+            .filter(|msg| {
+                let status = msg[0] & 0xF0;
+                status == 0xB0 && msg[1] == 66 && msg[2] == 0
+            })
+            .count();
+        assert_eq!(sostenuto_off_count, 16, "Should have sent sostenuto off for all 16 channels");
+
+        // Verify soft pedal off messages for all 16 channels
+        let soft_off_count = midi_output.sent_messages.iter()
+            .filter(|msg| {
+                let status = msg[0] & 0xF0;
+                status == 0xB0 && msg[1] == 67 && msg[2] == 0
+            })
+            .count();
+        assert_eq!(soft_off_count, 16, "Should have sent soft pedal off for all 16 channels");
     }
 }
