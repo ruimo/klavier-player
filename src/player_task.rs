@@ -309,6 +309,7 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
   }
 
   /// Calculate and execute sleep until the next event
+  /// If sleep duration exceeds 100ms, sleep for 100ms to allow periodic command checking
   fn wait_for_next_event(
     &self,
     play_state: &PlayState,
@@ -322,7 +323,11 @@ impl<M: MidiOutput, C: Clock> PlayerTask<M, C> {
       let cycles_from_start = next_cycle.saturating_sub(play_state.cycle_offset);
       let target_time = play_state.start_timestamp + Duration::from_nanos(cycles_from_start * crate::CYCLE_DURATION_NANOS);
       let sleep_duration = target_time - now;
-      self.clock.sleep(sleep_duration);
+      
+      // Cap sleep duration at 100ms to allow periodic command checking
+      let actual_sleep = sleep_duration.min(Duration::from_millis(100));
+      self.clock.sleep(actual_sleep);
+      
       PlayResult::Continue
     }
   }
@@ -876,12 +881,13 @@ mod tests {
         assert_eq!(midi_output.sent_messages[0][0] & 0xF0, 0x90, "Should be Note On");
         assert_eq!(midi_output.sent_messages[0][2], 100, "Velocity should be 100 (Note On)");
         
-        // Verify sleep was called with correct duration (until note_off_cycle)
+        // Verify sleep was called with correct duration (until note_off_cycle, capped at 100ms)
         let sleep_calls = clock1.sleep_calls();
         assert_eq!(sleep_calls.len(), 1, "Should have called sleep once");
-        let expected_sleep_nanos = note_off_cycle * crate::CYCLE_DURATION_NANOS - (crate::CYCLE_DURATION_NANOS + 2);
+        let calculated_sleep_nanos = note_off_cycle * crate::CYCLE_DURATION_NANOS - (crate::CYCLE_DURATION_NANOS + 2);
+        let expected_sleep_nanos = calculated_sleep_nanos.min(100_000_000); // Cap at 100ms
         assert_eq!(sleep_calls[0].as_nanos(), expected_sleep_nanos as u128,
-            "Sleep duration should be {} nanoseconds", expected_sleep_nanos);
+            "Sleep duration should be {} nanoseconds (capped at 100ms)", expected_sleep_nanos);
 
         // Test 2: At exactly note_off_cycle - should NOT send Note Off yet
         let clock2 = MockClock::new(vec![
@@ -984,16 +990,17 @@ mod tests {
         // Note On at cycle 0 is BEFORE start_cycle (500), so it should NOT be sent
         assert_eq!(midi_output.sent_messages.len(), 0, "No messages should be sent (note_on is before start_cycle)");
         
-        // Verify sleep was called (waiting for note_off at cycle 1000000)
+        // Verify sleep was called (waiting for note_off at cycle 1000000, capped at 100ms)
         let sleep_calls = clock1.sleep_calls();
         assert_eq!(sleep_calls.len(), 1, "Should have called sleep once");
         // target_time = base_time + (note_off_cycle - start_cycle) * crate::CYCLE_DURATION_NANOS
         //             = base_time + (1000000 - 500) * 1000
         // now = base_time + 1002ns
         // sleep_duration = target_time - now = (1000000 - 500) * 1000 - 1002
-        let expected_sleep = (note_off_cycle - start_cycle) * crate::CYCLE_DURATION_NANOS - (crate::CYCLE_DURATION_NANOS + 2);
+        let calculated_sleep = (note_off_cycle - start_cycle) * crate::CYCLE_DURATION_NANOS - (crate::CYCLE_DURATION_NANOS + 2);
+        let expected_sleep = calculated_sleep.min(100_000_000); // Cap at 100ms
         assert_eq!(sleep_calls[0].as_nanos(), expected_sleep as u128,
-            "Sleep duration should be {} nanoseconds", expected_sleep);
+            "Sleep duration should be {} nanoseconds (capped at 100ms)", expected_sleep);
 
         // Test 2: Advance past note_off_cycle to send Note Off
         let clock2 = MockClock::new(vec![
@@ -1085,5 +1092,83 @@ mod tests {
         // Verify second play response
         let resp3 = resp_receiver.try_recv().unwrap();
         assert!(matches!(resp3, Resp::Info { seq: 2, .. }), "Should receive play info for seq 2");
+    }
+
+    #[test]
+    fn test_stop_command_during_note_playback() {
+        // This test verifies that stop command works during note playback
+        // (between Note On and Note Off), which was previously blocked by sleep
+        
+        let midi_output = MockMidiOutput::new();
+        let (cmd_sender, cmd_receiver) = mpsc::sync_channel::<Cmd>(10);
+        let (_resp_sender, _resp_receiver) = mpsc::sync_channel::<Resp>(10);
+
+        // Create test PlayData with a single note that has long duration
+        let play_data = create_single_note_play_data();
+        let note_off_cycle = play_data.midi_data[1].0;
+        
+        let play_cmd_data = PlayCmdData {
+            seq: 1,
+            play_data,
+            start_cycle: 0,
+        };
+
+        // Create PlayState
+        let base_time = Instant::now();
+        let mut play_state = PlayState {
+            play_cmd_data,
+            cycle_offset: 0,
+            start_timestamp: base_time,
+            current_idx: 0,
+        };
+
+        // Simulate: Note On sent at cycle 1, now waiting for Note Off
+        // The sleep duration would be very long (note_off_cycle - 1)
+        let clock = MockClock::new(vec![
+            base_time + Duration::from_nanos(crate::CYCLE_DURATION_NANOS + 1),  // current_position = 1
+            base_time + Duration::from_nanos(crate::CYCLE_DURATION_NANOS + 2),  // for sleep calculation
+        ]);
+
+        let mut player_task = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock);
+        
+        // First play_cycle: sends Note On and starts waiting
+        let result1 = player_task.play_cycle(&mut play_state);
+        assert!(matches!(result1, PlayResult::Continue), "Should continue after Note On");
+        
+        let (_, midi_output, cmd_receiver, _resp_sender, clock) = player_task.take();
+        
+        // Verify Note On was sent
+        assert_eq!(midi_output.sent_messages.len(), 1, "Should have sent Note On");
+        assert_eq!(midi_output.sent_messages[0][0] & 0xF0, 0x90, "Should be Note On");
+        
+        // Verify sleep was called (but capped at 100ms, not the full duration)
+        let sleep_calls = clock.sleep_calls();
+        assert_eq!(sleep_calls.len(), 1, "Should have called sleep once");
+        let calculated_sleep = note_off_cycle * crate::CYCLE_DURATION_NANOS - (crate::CYCLE_DURATION_NANOS + 2);
+        assert!(calculated_sleep > 100_000_000, "Note duration should be longer than 100ms for this test");
+        assert_eq!(sleep_calls[0].as_nanos(), 100_000_000, "Sleep should be capped at 100ms");
+        
+        // Now send stop command DURING the note playback (before Note Off)
+        cmd_sender.send(Cmd::Stop { seq: 1 }).unwrap();
+        
+        // Create new clock for second play_cycle
+        // This simulates time advancing by 100ms (the sleep duration)
+        let clock2 = MockClock::new(vec![
+            base_time + Duration::from_millis(100) + Duration::from_nanos(crate::CYCLE_DURATION_NANOS + 2),
+        ]);
+        
+        let mut player_task2 = PlayerTask::new(midi_output, cmd_receiver, _resp_sender, clock2);
+        
+        // Second play_cycle: should process the stop command
+        let result2 = player_task2.play_cycle(&mut play_state);
+        
+        // Verify that stop command was processed
+        assert!(matches!(result2, PlayResult::Stopped), "Should stop when stop command is received during note playback");
+        
+        let (_, midi_output, _, _, _) = player_task2.take();
+        
+        // Verify that Note Off was NOT sent (stopped before reaching it)
+        // Only Note On should have been sent in the first cycle
+        assert_eq!(midi_output.sent_messages.len(), 1, "Should still have only Note On (no Note Off after stop)");
     }
 }
